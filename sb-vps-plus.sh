@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="sb-vps-plus"
-SCRIPT_VERSION="2026.05.03-4"
+SCRIPT_VERSION="2026.05.03-5"
 SING_BOX_VERSION="${SING_BOX_VERSION:-1.13.8}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/Zijing95/sing-box-JOJO/main/sb-vps-plus.sh}"
 BASE_DIR="/etc/s-box-plus"
@@ -167,9 +167,13 @@ ensure_cert() {
 
 issue_acme_cert() {
   [ -n "${ACME_DOMAIN:-}" ] || die "在线申请证书需要域名"
+  reject_control_chars "ACME 域名" "${ACME_DOMAIN}"
+  reject_control_chars "ACME 邮箱" "${ACME_EMAIL:-}"
   yellow "准备为 ${ACME_DOMAIN} 申请 Let's Encrypt 证书。请确认域名已解析到本机，且 TCP 80 未被占用。"
-  read -r -p "继续申请请输入 YES: " confirm || true
-  [ "${confirm}" = "YES" ] || die "已取消在线申请证书"
+  if [ "${AUTO_MODE:-0}" != "1" ] && [ "${ASSUME_YES:-0}" != "1" ]; then
+    read -r -p "继续申请请输入 YES: " confirm || true
+    [ "${confirm}" = "YES" ] || die "已取消在线申请证书"
+  fi
 
   if ! has_cmd socat; then
     if has_cmd apt-get; then
@@ -184,7 +188,7 @@ issue_acme_cert() {
   fi
 
   if [ ! -x "${HOME}/.acme.sh/acme.sh" ]; then
-    curl -fsSL https://get.acme.sh | sh -s email="${ACME_EMAIL:-admin@${ACME_DOMAIN}}"
+    curl -fsSL --retry 3 --connect-timeout 15 https://get.acme.sh | sh -s email="${ACME_EMAIL:-admin@${ACME_DOMAIN}}"
   fi
 
   "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt
@@ -208,39 +212,94 @@ read_default() {
   printf '%s' "${value:-$default}"
 }
 
+is_uint() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+validate_port() {
+  local name value
+  name="$1"
+  value="$2"
+  is_uint "${value}" || die "${name} 必须是数字端口：${value}"
+  [ "${value}" -ge 1 ] && [ "${value}" -le 65535 ] || die "${name} 超出范围 1-65535：${value}"
+}
+
+reject_control_chars() {
+  local name value
+  name="$1"
+  value="$2"
+  case "${value}" in
+    *$'\n'* | *$'\r'* | *$'\t'*) die "${name} 不能包含换行或制表符" ;;
+  esac
+}
+
+validate_runtime_values() {
+  reject_control_chars "服务器地址" "${SERVER_ADDR:-}"
+  reject_control_chars "TLS 域名" "${TLS_SERVER_NAME:-}"
+  reject_control_chars "Reality 域名" "${REALITY_SERVER_NAME:-}"
+  reject_control_chars "证书路径" "${TLS_CERT_PATH:-}"
+  reject_control_chars "私钥路径" "${TLS_KEY_PATH:-}"
+  validate_port "VLESS_PORT" "${VLESS_PORT:-}"
+  validate_port "ANYTLS_PORT" "${ANYTLS_PORT:-}"
+  validate_port "HY2_PORT" "${HY2_PORT:-}"
+  validate_port "TUIC_PORT" "${TUIC_PORT:-}"
+  [ "${VLESS_PORT:-}" != "${ANYTLS_PORT:-}" ] || die "VLESS 和 AnyTLS 不能使用同一个 TCP 端口"
+  [ "${HY2_PORT:-}" != "${TUIC_PORT:-}" ] || die "Hysteria2 和 TUIC 不能使用同一个 UDP 端口"
+}
+
 load_env() {
   if [ -f "${ENV_PATH}" ]; then
+    local mode
+    [ -O "${ENV_PATH}" ] || die "env 文件不是当前用户/root 创建，拒绝加载：${ENV_PATH}"
+    mode="$(stat -c '%a' "${ENV_PATH}" 2>/dev/null || stat -f '%Lp' "${ENV_PATH}" 2>/dev/null || printf '600')"
+    if [ $((8#${mode} & 0077)) -ne 0 ]; then
+      chmod 600 "${ENV_PATH}"
+    fi
+    if grep -nEv '^[A-Z0-9_]+=' "${ENV_PATH}" >/dev/null; then
+      die "env 文件包含异常行，拒绝加载：${ENV_PATH}"
+    fi
+    if grep -Eq '(\$\(|`|;|&&|\|\||[<>])' "${ENV_PATH}"; then
+      die "env 文件包含可疑 shell 片段，拒绝加载：${ENV_PATH}"
+    fi
     # shellcheck disable=SC1090
     . "${ENV_PATH}"
   fi
 }
 
 save_env() {
-  cat > "${ENV_PATH}" <<EOF
-SERVER_ADDR='${SERVER_ADDR}'
-SERVER_LINK='${SERVER_LINK}'
-SERVER_HOST='${SERVER_HOST}'
-TLS_SERVER_NAME='${TLS_SERVER_NAME}'
-REALITY_SERVER_NAME='${REALITY_SERVER_NAME}'
-REALITY_DEST='${REALITY_DEST}'
-VLESS_PORT='${VLESS_PORT}'
-ANYTLS_PORT='${ANYTLS_PORT}'
-HY2_PORT='${HY2_PORT}'
-TUIC_PORT='${TUIC_PORT}'
-UUID='${UUID}'
-REALITY_PRIVATE_KEY='${REALITY_PRIVATE_KEY}'
-REALITY_PUBLIC_KEY='${REALITY_PUBLIC_KEY}'
-REALITY_SHORT_ID='${REALITY_SHORT_ID}'
-ANYTLS_PASSWORD='${ANYTLS_PASSWORD}'
-HY2_PASSWORD='${HY2_PASSWORD}'
-HY2_OBFS='${HY2_OBFS}'
-TUIC_PASSWORD='${TUIC_PASSWORD}'
-TLS_CERT_PATH='${TLS_CERT_PATH:-}'
-TLS_KEY_PATH='${TLS_KEY_PATH:-}'
-CERT_MODE='${CERT_MODE:-1}'
-ACME_DOMAIN='${ACME_DOMAIN:-}'
-ACME_EMAIL='${ACME_EMAIL:-}'
-EOF
+  local tmp
+  validate_runtime_values
+  tmp="${ENV_PATH}.tmp"
+  {
+    printf 'SERVER_ADDR=%q\n' "${SERVER_ADDR:-}"
+    printf 'SERVER_LINK=%q\n' "${SERVER_LINK:-}"
+    printf 'SERVER_HOST=%q\n' "${SERVER_HOST:-}"
+    printf 'TLS_SERVER_NAME=%q\n' "${TLS_SERVER_NAME:-}"
+    printf 'REALITY_SERVER_NAME=%q\n' "${REALITY_SERVER_NAME:-}"
+    printf 'REALITY_DEST=%q\n' "${REALITY_DEST:-}"
+    printf 'VLESS_PORT=%q\n' "${VLESS_PORT:-}"
+    printf 'ANYTLS_PORT=%q\n' "${ANYTLS_PORT:-}"
+    printf 'HY2_PORT=%q\n' "${HY2_PORT:-}"
+    printf 'TUIC_PORT=%q\n' "${TUIC_PORT:-}"
+    printf 'UUID=%q\n' "${UUID:-}"
+    printf 'REALITY_PRIVATE_KEY=%q\n' "${REALITY_PRIVATE_KEY:-}"
+    printf 'REALITY_PUBLIC_KEY=%q\n' "${REALITY_PUBLIC_KEY:-}"
+    printf 'REALITY_SHORT_ID=%q\n' "${REALITY_SHORT_ID:-}"
+    printf 'ANYTLS_PASSWORD=%q\n' "${ANYTLS_PASSWORD:-}"
+    printf 'HY2_PASSWORD=%q\n' "${HY2_PASSWORD:-}"
+    printf 'HY2_OBFS=%q\n' "${HY2_OBFS:-}"
+    printf 'TUIC_PASSWORD=%q\n' "${TUIC_PASSWORD:-}"
+    printf 'TLS_CERT_PATH=%q\n' "${TLS_CERT_PATH:-}"
+    printf 'TLS_KEY_PATH=%q\n' "${TLS_KEY_PATH:-}"
+    printf 'CERT_MODE=%q\n' "${CERT_MODE:-1}"
+    printf 'ACME_DOMAIN=%q\n' "${ACME_DOMAIN:-}"
+    printf 'ACME_EMAIL=%q\n' "${ACME_EMAIL:-}"
+  } > "${tmp}"
+  chmod 600 "${tmp}"
+  mv "${tmp}" "${ENV_PATH}"
 }
 
 collect_inputs() {
@@ -796,8 +855,13 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=${BASE_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -807,21 +871,38 @@ EOF
 create_cli() {
   cat > "${CLI_PATH}" <<EOF
 #!/usr/bin/env bash
-bash <(curl -Ls "${REPO_RAW_URL}") "\$@"
+bash <(curl -fLs --retry 3 --connect-timeout 15 "${REPO_RAW_URL}") "\$@"
 EOF
   chmod 0755 "${CLI_PATH}"
 }
 
 backup_current_config() {
   mkdir -p "${BACKUP_DIR}"
-  if [ ! -e "${CONFIG_PATH}" ] && [ ! -e "${ENV_PATH}" ] && [ ! -e "${LINKS_PATH}" ]; then
+  local items=(
+    config.json
+    client-sing-box.json
+    mihomo.yaml
+    loon.conf
+    shadowrocket.conf
+    shadowrocket-links.txt
+    env
+    links.txt
+    cert.pem
+    private.key
+    qrcode
+  )
+  local existing=()
+  local item
+  for item in "${items[@]}"; do
+    [ -e "${BASE_DIR}/${item}" ] && existing+=("${item}")
+  done
+  if [ "${#existing[@]}" -eq 0 ]; then
     return
   fi
 
   local backup_file
   backup_file="${BACKUP_DIR}/s-box-plus-$(date +%Y%m%d-%H%M%S).tar.gz"
-  tar -czf "${backup_file}" -C "${BASE_DIR}" \
-    config.json client-sing-box.json mihomo.yaml loon.conf shadowrocket.conf shadowrocket-links.txt env links.txt cert.pem private.key qrcode 2>/dev/null || true
+  tar -czf "${backup_file}" -C "${BASE_DIR}" "${existing[@]}"
   if [ -s "${backup_file}" ]; then
     green "已备份当前配置：${backup_file}"
   else
@@ -848,6 +929,9 @@ restore_backup() {
   read -r -p "恢复会覆盖当前 ${BASE_DIR} 配置，确认请输入 YES: " confirm || true
   [ "${confirm}" = "YES" ] || die "已取消"
   mkdir -p "${BASE_DIR}"
+  if tar -tzf "${backup_file}" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    die "备份包包含不安全路径，已拒绝恢复：${backup_file}"
+  fi
   tar -xzf "${backup_file}" -C "${BASE_DIR}"
   if [ -x "${BIN_PATH}" ] && [ -f "${CONFIG_PATH}" ]; then
     "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "恢复后的配置检查失败，未重启服务"
@@ -1003,6 +1087,10 @@ record_east_ct_result() {
   route_ok="$(read_default "路由是否直去亚洲且未明显绕美国/欧洲？y/n" "y")"
   note="$(read_default "备注，例如 东京-甲骨文-晚高峰" "east-ct-test")"
   now="$(date '+%Y-%m-%d %H:%M:%S')"
+  is_uint "${avg}" || die "平均延迟必须是整数"
+  is_uint "${loss}" || die "丢包率必须是整数"
+  is_uint "${jitter}" || die "抖动必须是整数"
+  reject_control_chars "备注" "${note}"
 
   mkdir -p "${BASE_DIR}"
   if [ ! -f "${EAST_CT_REPORT}" ]; then
@@ -1091,6 +1179,7 @@ install_all() {
 
 install_auto() {
   need_root
+  local AUTO_MODE=1
   mkdir -p "${BASE_DIR}"
   backup_current_config
   install_deps
@@ -1218,6 +1307,7 @@ regenerate_client_outputs() {
   need_root
   load_env
   ensure_server_context
+  validate_runtime_values
   create_links
   create_client_outputs
   create_qrcodes
