@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="sb-vps-plus"
-SCRIPT_VERSION="2026.05.03-2"
+SCRIPT_VERSION="2026.05.03-3"
 SING_BOX_VERSION="${SING_BOX_VERSION:-1.13.8}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/Zijing95/sing-box-JOJO/main/sb-vps-plus.sh}"
 BASE_DIR="/etc/s-box-plus"
@@ -19,6 +19,7 @@ ENV_PATH="${BASE_DIR}/env"
 LINKS_PATH="${BASE_DIR}/links.txt"
 QR_DIR="${BASE_DIR}/qrcode"
 BACKUP_DIR="${BASE_DIR}/backup"
+EAST_CT_REPORT="${BASE_DIR}/east-china-telecom.csv"
 CERT_PATH="${BASE_DIR}/cert.pem"
 KEY_PATH="${BASE_DIR}/private.key"
 SERVICE_PATH="/etc/systemd/system/sing-box-plus.service"
@@ -132,6 +133,13 @@ normalize_addresses() {
   fi
   SERVER_HOST="${SERVER_LINK#[}"
   SERVER_HOST="${SERVER_HOST%]}"
+}
+
+ensure_server_context() {
+  if [ -z "${SERVER_ADDR:-}" ]; then
+    SERVER_ADDR="$(detect_public_ip)"
+  fi
+  normalize_addresses
 }
 
 ensure_cert() {
@@ -698,6 +706,178 @@ show_firewall_tips() {
   yellow "甲骨文云还必须在控制台 Security List 或 NSG 同时放行这些端口。"
 }
 
+show_listening_ports() {
+  plain "当前监听端口："
+  if has_cmd ss; then
+    ss -lntup 2>/dev/null | grep -E "(:${VLESS_PORT:-0}|:${ANYTLS_PORT:-0}|:${HY2_PORT:-0}|:${TUIC_PORT:-0})\\b" || true
+  elif has_cmd netstat; then
+    netstat -lntup 2>/dev/null | grep -E "(:${VLESS_PORT:-0}|:${ANYTLS_PORT:-0}|:${HY2_PORT:-0}|:${TUIC_PORT:-0})\\b" || true
+  else
+    yellow "未检测到 ss/netstat，无法显示监听端口。"
+  fi
+}
+
+show_bbr_status() {
+  plain "TCP 拥塞控制："
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+  sysctl net.core.default_qdisc 2>/dev/null || true
+  if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi bbr; then
+    green "BBR 已启用。"
+  else
+    yellow "BBR 未启用或无法确认。可后续单独增加安全启用选项。"
+  fi
+}
+
+show_reverse_routes_to_china_telecom() {
+  local targets target name ip
+  targets="
+上海电信DNS 202.96.209.133
+上海电信节点 101.95.206.10
+江苏电信DNS1 218.2.2.2
+江苏电信DNS2 218.4.4.4
+中国电信DNS 114.114.114.114
+"
+
+  plain "VPS -> 华东/江苏电信 反向路由参考："
+  if has_cmd traceroute; then
+    while read -r name ip; do
+      [ -n "${name}" ] || continue
+      plain ""
+      plain "${name} (${ip})"
+      traceroute -n -w 1 -q 1 -m 12 "${ip}" 2>/dev/null || true
+    done <<EOF
+${targets}
+EOF
+  elif has_cmd tracepath; then
+    while read -r name ip; do
+      [ -n "${name}" ] || continue
+      plain ""
+      plain "${name} (${ip})"
+      tracepath -n -m 12 "${ip}" 2>/dev/null || true
+    done <<EOF
+${targets}
+EOF
+  else
+    yellow "未安装 traceroute/tracepath，跳过反向路由。"
+  fi
+}
+
+show_nanjing_ct_local_commands() {
+  load_env
+  ensure_server_context
+  plain "请在南京电信本地电脑运行以下命令，结果最有判断价值："
+  plain ""
+  plain "macOS/Linux:"
+  plain "ping -c 50 ${SERVER_HOST}"
+  plain "mtr -rwzc 100 ${SERVER_HOST}"
+  plain "nc -vz ${SERVER_HOST} ${VLESS_PORT:-443}"
+  plain "nc -vz ${SERVER_HOST} ${ANYTLS_PORT:-8443}"
+  plain ""
+  plain "Windows PowerShell:"
+  plain "ping ${SERVER_HOST} -n 50"
+  plain "tracert ${SERVER_HOST}"
+  plain "Test-NetConnection ${SERVER_HOST} -Port ${VLESS_PORT:-443}"
+  plain "Test-NetConnection ${SERVER_HOST} -Port ${ANYTLS_PORT:-8443}"
+  plain ""
+  plain "UDP 协议（Hysteria2/TUIC）不能只看 ping，重点看客户端连接后的丢包、抖动和晚高峰速度。"
+}
+
+score_east_ct_result() {
+  local avg loss jitter route_ok score level
+  avg="$1"
+  loss="$2"
+  jitter="$3"
+  route_ok="$4"
+  score=100
+
+  if [ "${avg}" -gt 120 ]; then score=$((score - 35)); elif [ "${avg}" -gt 90 ]; then score=$((score - 20)); elif [ "${avg}" -gt 70 ]; then score=$((score - 10)); fi
+  if [ "${loss}" -gt 3 ]; then score=$((score - 40)); elif [ "${loss}" -gt 1 ]; then score=$((score - 25)); elif [ "${loss}" -gt 0 ]; then score=$((score - 10)); fi
+  if [ "${jitter}" -gt 30 ]; then score=$((score - 25)); elif [ "${jitter}" -gt 20 ]; then score=$((score - 15)); elif [ "${jitter}" -gt 10 ]; then score=$((score - 8)); fi
+  if [ "${route_ok}" != "y" ] && [ "${route_ok}" != "Y" ]; then score=$((score - 20)); fi
+  [ "${score}" -lt 0 ] && score=0
+
+  if [ "${score}" -ge 85 ]; then
+    level="优秀，建议保留这个 IP"
+  elif [ "${score}" -ge 70 ]; then
+    level="可用，晚高峰再复测一次"
+  elif [ "${score}" -ge 55 ]; then
+    level="一般，建议尝试换 IP 或换区域"
+  else
+    level="较差，不建议保留"
+  fi
+
+  plain "评分：${score}/100，结论：${level}"
+}
+
+record_east_ct_result() {
+  need_root
+  load_env
+  ensure_server_context
+  local avg loss jitter route_ok note now
+  avg="$(read_default "南京电信 ping 平均延迟 ms，只填整数" "80")"
+  loss="$(read_default "丢包率百分比，只填整数，例如 0/1/3" "0")"
+  jitter="$(read_default "抖动 ms，只填整数；不知道填 10" "10")"
+  route_ok="$(read_default "路由是否直去亚洲且未明显绕美国/欧洲？y/n" "y")"
+  note="$(read_default "备注，例如 东京-甲骨文-晚高峰" "east-ct-test")"
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  mkdir -p "${BASE_DIR}"
+  if [ ! -f "${EAST_CT_REPORT}" ]; then
+    plain "time,server,avg_ms,loss_percent,jitter_ms,route_ok,note" > "${EAST_CT_REPORT}"
+  fi
+  plain "${now},${SERVER_HOST:-unknown},${avg},${loss},${jitter},${route_ok},${note}" >> "${EAST_CT_REPORT}"
+  score_east_ct_result "${avg}" "${loss}" "${jitter}" "${route_ok}"
+  green "已记录：${EAST_CT_REPORT}"
+}
+
+show_east_ct_records() {
+  need_root
+  if [ -f "${EAST_CT_REPORT}" ]; then
+    cat "${EAST_CT_REPORT}"
+  else
+    yellow "暂无华东电信测试记录。"
+  fi
+}
+
+east_china_telecom_check() {
+  need_root
+  load_env
+  ensure_server_context
+  plain "南京电信 / 华东电信优化检测"
+  plain "服务器：${SERVER_HOST}"
+  plain "目标判断：东京/韩国优秀通常 50-90ms、丢包 0%、抖动 <10ms；晚高峰 >3% 丢包建议换 IP。"
+  plain ""
+  show_bbr_status
+  plain ""
+  show_listening_ports
+  plain ""
+  show_firewall_tips
+  plain ""
+  show_reverse_routes_to_china_telecom
+  plain ""
+  show_nanjing_ct_local_commands
+}
+
+east_ct_menu() {
+  clear || true
+  plain "南京电信 / 华东电信优化检测"
+  plain "1. 一键检测本 VPS 状态、端口、反向路由"
+  plain "2. 显示南京本地测速命令"
+  plain "3. 记录一次南京电信测试结果并评分"
+  plain "4. 查看历史测试记录"
+  plain "0. 返回"
+  plain ""
+  read -r -p "请选择: " choice || true
+  case "${choice}" in
+    1) east_china_telecom_check ;;
+    2) show_nanjing_ct_local_commands ;;
+    3) record_east_ct_result ;;
+    4) show_east_ct_records ;;
+    0) menu ;;
+    *) die "无效选择" ;;
+  esac
+}
+
 install_all() {
   need_root
   mkdir -p "${BASE_DIR}"
@@ -782,7 +962,8 @@ menu() {
   plain "6. 显示二维码"
   plain "7. 防火墙/安全组提示"
   plain "8. 恢复配置备份"
-  plain "9. 卸载"
+  plain "9. 南京电信/华东电信优化检测"
+  plain "10. 卸载"
   plain "0. 退出"
   plain ""
   read -r -p "请选择: " choice || true
@@ -795,7 +976,8 @@ menu() {
     6) show_qrcodes ;;
     7) show_firewall_tips ;;
     8) restore_backup ;;
-    9) uninstall_all ;;
+    9) east_ct_menu ;;
+    10) uninstall_all ;;
     0) exit 0 ;;
     *) die "无效选择" ;;
   esac
@@ -810,6 +992,7 @@ case "${1:-}" in
   qrcode | qr) show_qrcodes ;;
   firewall) show_firewall_tips ;;
   restore) restore_backup ;;
+  east-ct | nanjing-ct) east_ct_menu ;;
   uninstall) uninstall_all ;;
   *) menu ;;
 esac
