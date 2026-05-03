@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="sb-vps-plus"
-SCRIPT_VERSION="2026.05.03"
+SCRIPT_VERSION="2026.05.03-2"
 SING_BOX_VERSION="${SING_BOX_VERSION:-1.13.8}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/Zijing95/sing-box-JOJO/main/sb-vps-plus.sh}"
 BASE_DIR="/etc/s-box-plus"
@@ -17,6 +17,8 @@ CONFIG_PATH="${BASE_DIR}/config.json"
 CLIENT_PATH="${BASE_DIR}/client-sing-box.json"
 ENV_PATH="${BASE_DIR}/env"
 LINKS_PATH="${BASE_DIR}/links.txt"
+QR_DIR="${BASE_DIR}/qrcode"
+BACKUP_DIR="${BASE_DIR}/backup"
 CERT_PATH="${BASE_DIR}/cert.pem"
 KEY_PATH="${BASE_DIR}/private.key"
 SERVICE_PATH="/etc/systemd/system/sing-box-plus.service"
@@ -66,6 +68,23 @@ install_deps() {
     apk add --no-cache ${pkgs} iproute2
   else
     die "不支持的系统包管理器，请手动安装 curl/wget/tar/openssl/jq/coreutils"
+  fi
+}
+
+install_optional_tools() {
+  if has_cmd qrencode; then
+    return
+  fi
+
+  yellow "尝试安装二维码工具 qrencode，失败不影响核心安装。"
+  if has_cmd apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >/dev/null 2>&1 || true
+  elif has_cmd dnf; then
+    dnf install -y qrencode >/dev/null 2>&1 || true
+  elif has_cmd yum; then
+    yum install -y qrencode >/dev/null 2>&1 || true
+  elif has_cmd apk; then
+    apk add --no-cache qrencode >/dev/null 2>&1 || true
   fi
 }
 
@@ -134,6 +153,41 @@ ensure_cert() {
   fi
 }
 
+issue_acme_cert() {
+  [ -n "${ACME_DOMAIN:-}" ] || die "在线申请证书需要域名"
+  yellow "准备为 ${ACME_DOMAIN} 申请 Let's Encrypt 证书。请确认域名已解析到本机，且 TCP 80 未被占用。"
+  read -r -p "继续申请请输入 YES: " confirm || true
+  [ "${confirm}" = "YES" ] || die "已取消在线申请证书"
+
+  if ! has_cmd socat; then
+    if has_cmd apt-get; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y socat
+    elif has_cmd dnf; then
+      dnf install -y socat
+    elif has_cmd yum; then
+      yum install -y socat
+    elif has_cmd apk; then
+      apk add --no-cache socat
+    fi
+  fi
+
+  if [ ! -x "${HOME}/.acme.sh/acme.sh" ]; then
+    curl -fsSL https://get.acme.sh | sh -s email="${ACME_EMAIL:-admin@${ACME_DOMAIN}}"
+  fi
+
+  "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt
+  "${HOME}/.acme.sh/acme.sh" --issue -d "${ACME_DOMAIN}" --standalone --keylength ec-256
+  "${HOME}/.acme.sh/acme.sh" --install-cert -d "${ACME_DOMAIN}" --ecc \
+    --fullchain-file "${CERT_PATH}" \
+    --key-file "${KEY_PATH}" \
+    --reloadcmd "systemctl restart sing-box-plus >/dev/null 2>&1 || true"
+
+  TLS_CERT_PATH="${CERT_PATH}"
+  TLS_KEY_PATH="${KEY_PATH}"
+  TLS_SERVER_NAME="${ACME_DOMAIN}"
+  green "证书已安装到 ${CERT_PATH} 和 ${KEY_PATH}"
+}
+
 read_default() {
   local prompt default value
   prompt="$1"
@@ -171,6 +225,9 @@ HY2_OBFS='${HY2_OBFS}'
 TUIC_PASSWORD='${TUIC_PASSWORD}'
 TLS_CERT_PATH='${TLS_CERT_PATH:-}'
 TLS_KEY_PATH='${TLS_KEY_PATH:-}'
+CERT_MODE='${CERT_MODE:-1}'
+ACME_DOMAIN='${ACME_DOMAIN:-}'
+ACME_EMAIL='${ACME_EMAIL:-}'
 EOF
 }
 
@@ -184,12 +241,28 @@ collect_inputs() {
   HY2_PORT="$(read_default "Hysteria2 端口 UDP" "$(random_port)")"
   TUIC_PORT="$(read_default "TUIC v5 端口 UDP" "$(random_port)")"
 
-  read -r -p "已有真实 TLS 证书路径？没有就回车使用自签证书: " TLS_CERT_PATH || true
-  if [ -n "${TLS_CERT_PATH}" ]; then
-    read -r -p "TLS 私钥路径: " TLS_KEY_PATH || true
-  else
-    TLS_KEY_PATH=""
-  fi
+  plain ""
+  plain "TLS 证书模式："
+  plain "1. 自签证书（最省事，客户端会 insecure=true）"
+  plain "2. 使用已有证书"
+  plain "3. 在线申请 Let's Encrypt 证书（需要域名解析到本机，并放行 TCP 80）"
+  CERT_MODE="$(read_default "请选择证书模式" "1")"
+  TLS_CERT_PATH=""
+  TLS_KEY_PATH=""
+  ACME_DOMAIN=""
+  ACME_EMAIL=""
+  case "${CERT_MODE}" in
+    1) ;;
+    2)
+      read -r -p "TLS 证书 fullchain 路径: " TLS_CERT_PATH || true
+      read -r -p "TLS 私钥路径: " TLS_KEY_PATH || true
+      ;;
+    3)
+      ACME_DOMAIN="$(read_default "申请证书的域名" "${TLS_SERVER_NAME}")"
+      ACME_EMAIL="$(read_default "ACME 邮箱" "admin@${ACME_DOMAIN}")"
+      ;;
+    *) die "无效证书模式" ;;
+  esac
   normalize_addresses
 
   UUID="$("${BIN_PATH}" generate uuid)"
@@ -446,6 +519,10 @@ create_client_config() {
 }
 
 create_links() {
+  VLESS_LINK="vless://${UUID}@${SERVER_LINK}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#VLESS-Reality-Plus"
+  HY2_LINK="hysteria2://${HY2_PASSWORD}@${SERVER_LINK}:${HY2_PORT}?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${TLS_SERVER_NAME}&insecure=1#HY2-Plus"
+  TUIC_LINK="tuic://${UUID}:${TUIC_PASSWORD}@${SERVER_LINK}:${TUIC_PORT}?congestion_control=bbr&udp_relay_mode=native&sni=${TLS_SERVER_NAME}&allow_insecure=1#TUIC-v5-Plus"
+
   cat > "${LINKS_PATH}" <<EOF
 sing-box VPS Plus ${SCRIPT_VERSION}
 
@@ -453,13 +530,13 @@ sing-box VPS Plus ${SCRIPT_VERSION}
 sing-box 版本: ${SING_BOX_VERSION}
 
 VLESS Reality:
-vless://${UUID}@${SERVER_LINK}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#VLESS-Reality-Plus
+${VLESS_LINK}
 
 Hysteria2:
-hysteria2://${HY2_PASSWORD}@${SERVER_LINK}:${HY2_PORT}?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${TLS_SERVER_NAME}&insecure=1#HY2-Plus
+${HY2_LINK}
 
 TUIC v5:
-tuic://${UUID}:${TUIC_PASSWORD}@${SERVER_LINK}:${TUIC_PORT}?congestion_control=bbr&udp_relay_mode=native&sni=${TLS_SERVER_NAME}&allow_insecure=1#TUIC-v5-Plus
+${TUIC_LINK}
 
 AnyTLS:
 请优先使用 ${CLIENT_PATH} 中的 sing-box 客户端配置。
@@ -468,6 +545,48 @@ AnyTLS:
 TCP: ${VLESS_PORT}, ${ANYTLS_PORT}
 UDP: ${HY2_PORT}, ${TUIC_PORT}
 EOF
+}
+
+create_qrcodes() {
+  mkdir -p "${QR_DIR}"
+  if ! has_cmd qrencode; then
+    yellow "未安装 qrencode，跳过二维码生成。"
+    return
+  fi
+
+  [ -n "${VLESS_LINK:-}" ] || create_links
+  qrencode -o "${QR_DIR}/vless-reality.png" "${VLESS_LINK}" || true
+  qrencode -o "${QR_DIR}/hysteria2.png" "${HY2_LINK}" || true
+  qrencode -o "${QR_DIR}/tuic-v5.png" "${TUIC_LINK}" || true
+
+  cat > "${QR_DIR}/README.txt" <<EOF
+二维码文件:
+${QR_DIR}/vless-reality.png
+${QR_DIR}/hysteria2.png
+${QR_DIR}/tuic-v5.png
+
+终端显示二维码:
+sbp qrcode
+EOF
+}
+
+show_qrcodes() {
+  need_root
+  if ! has_cmd qrencode; then
+    yellow "未安装 qrencode，无法在终端显示二维码。"
+    plain "链接文件：${LINKS_PATH}"
+    return
+  fi
+  if [ ! -f "${LINKS_PATH}" ]; then
+    die "未找到节点信息，请先安装。"
+  fi
+  plain "VLESS Reality:"
+  awk '/^vless:\/\// {print; exit}' "${LINKS_PATH}" | qrencode -t ansiutf8
+  plain "Hysteria2:"
+  awk '/^hysteria2:\/\// {print; exit}' "${LINKS_PATH}" | qrencode -t ansiutf8
+  plain "TUIC v5:"
+  awk '/^tuic:\/\// {print; exit}' "${LINKS_PATH}" | qrencode -t ansiutf8
+  plain "PNG 文件目录：${QR_DIR}"
 }
 
 create_service() {
@@ -502,17 +621,100 @@ EOF
   chmod 0755 "${CLI_PATH}"
 }
 
+backup_current_config() {
+  mkdir -p "${BACKUP_DIR}"
+  if [ ! -e "${CONFIG_PATH}" ] && [ ! -e "${ENV_PATH}" ] && [ ! -e "${LINKS_PATH}" ]; then
+    return
+  fi
+
+  local backup_file
+  backup_file="${BACKUP_DIR}/s-box-plus-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "${backup_file}" -C "${BASE_DIR}" \
+    config.json client-sing-box.json env links.txt cert.pem private.key qrcode 2>/dev/null || true
+  if [ -s "${backup_file}" ]; then
+    green "已备份当前配置：${backup_file}"
+  else
+    rm -f "${backup_file}"
+  fi
+}
+
+list_backups() {
+  if [ ! -d "${BACKUP_DIR}" ]; then
+    yellow "暂无备份。"
+    return 1
+  fi
+  find "${BACKUP_DIR}" -maxdepth 1 -type f -name '*.tar.gz' | sort -r
+}
+
+restore_backup() {
+  need_root
+  local latest backup_file
+  latest="$(list_backups | head -n 1 || true)"
+  [ -n "${latest}" ] || die "暂无可恢复备份"
+  plain "最新备份：${latest}"
+  backup_file="$(read_default "要恢复的备份文件" "${latest}")"
+  [ -f "${backup_file}" ] || die "备份文件不存在：${backup_file}"
+  read -r -p "恢复会覆盖当前 ${BASE_DIR} 配置，确认请输入 YES: " confirm || true
+  [ "${confirm}" = "YES" ] || die "已取消"
+  mkdir -p "${BASE_DIR}"
+  tar -xzf "${backup_file}" -C "${BASE_DIR}"
+  if [ -x "${BIN_PATH}" ] && [ -f "${CONFIG_PATH}" ]; then
+    "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "恢复后的配置检查失败，未重启服务"
+    systemctl restart sing-box-plus || true
+  fi
+  green "已恢复备份：${backup_file}"
+}
+
+show_firewall_tips() {
+  need_root
+  load_env
+  plain "需要放行的端口："
+  plain "TCP: ${VLESS_PORT:-VLESS端口}, ${ANYTLS_PORT:-AnyTLS端口}"
+  plain "UDP: ${HY2_PORT:-Hysteria2端口}, ${TUIC_PORT:-TUIC端口}"
+  plain ""
+
+  if has_cmd ufw; then
+    plain "UFW 状态："
+    ufw status || true
+    plain "可参考命令："
+    plain "ufw allow ${VLESS_PORT:-端口}/tcp"
+    plain "ufw allow ${ANYTLS_PORT:-端口}/tcp"
+    plain "ufw allow ${HY2_PORT:-端口}/udp"
+    plain "ufw allow ${TUIC_PORT:-端口}/udp"
+  elif has_cmd firewall-cmd; then
+    plain "firewalld 状态："
+    firewall-cmd --state || true
+    plain "可参考命令："
+    plain "firewall-cmd --permanent --add-port=${VLESS_PORT:-端口}/tcp"
+    plain "firewall-cmd --permanent --add-port=${ANYTLS_PORT:-端口}/tcp"
+    plain "firewall-cmd --permanent --add-port=${HY2_PORT:-端口}/udp"
+    plain "firewall-cmd --permanent --add-port=${TUIC_PORT:-端口}/udp"
+    plain "firewall-cmd --reload"
+  else
+    yellow "未检测到 ufw/firewalld。请检查系统防火墙、云厂商安全组或 iptables/nftables。"
+  fi
+
+  plain ""
+  yellow "甲骨文云还必须在控制台 Security List 或 NSG 同时放行这些端口。"
+}
+
 install_all() {
   need_root
   mkdir -p "${BASE_DIR}"
+  backup_current_config
   install_deps
+  install_optional_tools
   download_sing_box
   collect_inputs
+  if [ "${CERT_MODE:-1}" = "3" ]; then
+    issue_acme_cert
+  fi
   ensure_cert
   save_env
   create_server_config
   create_client_config
   create_links
+  create_qrcodes
   create_service
   "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "配置检查失败，未启动服务"
   systemctl daemon-reload
@@ -520,6 +722,7 @@ install_all() {
   create_cli
   green "安装完成。快捷命令：sbp"
   show_info
+  show_firewall_tips
 }
 
 show_info() {
@@ -535,6 +738,7 @@ show_info() {
   plain "服务状态：systemctl status sing-box-plus --no-pager"
   plain "查看日志：journalctl -u sing-box-plus -f"
   plain "客户端配置：${CLIENT_PATH}"
+  plain "二维码目录：${QR_DIR}"
 }
 
 restart_service() {
@@ -575,7 +779,10 @@ menu() {
   plain "3. 检查配置并重启"
   plain "4. 查看服务状态"
   plain "5. 查看最近日志"
-  plain "6. 卸载"
+  plain "6. 显示二维码"
+  plain "7. 防火墙/安全组提示"
+  plain "8. 恢复配置备份"
+  plain "9. 卸载"
   plain "0. 退出"
   plain ""
   read -r -p "请选择: " choice || true
@@ -585,7 +792,10 @@ menu() {
     3) restart_service ;;
     4) show_status ;;
     5) show_logs ;;
-    6) uninstall_all ;;
+    6) show_qrcodes ;;
+    7) show_firewall_tips ;;
+    8) restore_backup ;;
+    9) uninstall_all ;;
     0) exit 0 ;;
     *) die "无效选择" ;;
   esac
@@ -597,6 +807,9 @@ case "${1:-}" in
   restart) restart_service ;;
   status) show_status ;;
   logs) show_logs ;;
+  qrcode | qr) show_qrcodes ;;
+  firewall) show_firewall_tips ;;
+  restore) restore_backup ;;
   uninstall) uninstall_all ;;
   *) menu ;;
 esac
