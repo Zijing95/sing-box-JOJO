@@ -8,13 +8,17 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="sb-vps-plus"
-SCRIPT_VERSION="2026.05.03-3"
+SCRIPT_VERSION="2026.05.03-4"
 SING_BOX_VERSION="${SING_BOX_VERSION:-1.13.8}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/Zijing95/sing-box-JOJO/main/sb-vps-plus.sh}"
 BASE_DIR="/etc/s-box-plus"
 BIN_PATH="${BASE_DIR}/sing-box"
 CONFIG_PATH="${BASE_DIR}/config.json"
 CLIENT_PATH="${BASE_DIR}/client-sing-box.json"
+MIHOMO_PATH="${BASE_DIR}/mihomo.yaml"
+LOON_PATH="${BASE_DIR}/loon.conf"
+SHADOWROCKET_PATH="${BASE_DIR}/shadowrocket.conf"
+SHADOWROCKET_LINKS_PATH="${BASE_DIR}/shadowrocket-links.txt"
 ENV_PATH="${BASE_DIR}/env"
 LINKS_PATH="${BASE_DIR}/links.txt"
 QR_DIR="${BASE_DIR}/qrcode"
@@ -283,6 +287,34 @@ collect_inputs() {
   HY2_PASSWORD="$(random_base64 24 32)"
   HY2_OBFS="$(random_base64 16 24)"
   TUIC_PASSWORD="$(random_base64 24 32)"
+}
+
+collect_auto_inputs() {
+  SERVER_ADDR="${SERVER_ADDR:-$(detect_public_ip)}"
+  TLS_SERVER_NAME="${TLS_SERVER_NAME:-www.apple.com}"
+  REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
+  REALITY_DEST="${REALITY_SERVER_NAME}:443"
+  VLESS_PORT="${VLESS_PORT:-$(random_port)}"
+  ANYTLS_PORT="${ANYTLS_PORT:-$(random_port)}"
+  HY2_PORT="${HY2_PORT:-$(random_port)}"
+  TUIC_PORT="${TUIC_PORT:-$(random_port)}"
+  CERT_MODE="${CERT_MODE:-1}"
+  TLS_CERT_PATH="${TLS_CERT_PATH:-}"
+  TLS_KEY_PATH="${TLS_KEY_PATH:-}"
+  ACME_DOMAIN="${ACME_DOMAIN:-}"
+  ACME_EMAIL="${ACME_EMAIL:-}"
+  normalize_addresses
+
+  UUID="${UUID:-$("${BIN_PATH}" generate uuid)}"
+  local keypair
+  keypair="$("${BIN_PATH}" generate reality-keypair)"
+  REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-$(printf '%s\n' "${keypair}" | awk '/PrivateKey:/ {print $2}')}"
+  REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-$(printf '%s\n' "${keypair}" | awk '/PublicKey:/ {print $2}')}"
+  REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(random_hex 8)}"
+  ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(random_base64 24 32)}"
+  HY2_PASSWORD="${HY2_PASSWORD:-$(random_base64 24 32)}"
+  HY2_OBFS="${HY2_OBFS:-$(random_base64 16 24)}"
+  TUIC_PASSWORD="${TUIC_PASSWORD:-$(random_base64 24 32)}"
 }
 
 create_server_config() {
@@ -555,6 +587,157 @@ UDP: ${HY2_PORT}, ${TUIC_PORT}
 EOF
 }
 
+client_insecure_value() {
+  if [ -n "${TLS_CERT_PATH:-}" ] && [ -n "${TLS_KEY_PATH:-}" ]; then
+    printf 'false'
+  else
+    printf 'true'
+  fi
+}
+
+create_mihomo_config() {
+  local insecure
+  ensure_server_context
+  insecure="$(client_insecure_value)"
+  cat > "${MIHOMO_PATH}" <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: true
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+
+proxies:
+  - name: VLESS-Reality-Plus
+    type: vless
+    server: "${SERVER_HOST}"
+    port: ${VLESS_PORT}
+    uuid: "${UUID}"
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: "${REALITY_SERVER_NAME}"
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "${REALITY_PUBLIC_KEY}"
+      short-id: "${REALITY_SHORT_ID}"
+
+  - name: Hysteria2-Plus
+    type: hysteria2
+    server: "${SERVER_HOST}"
+    port: ${HY2_PORT}
+    password: "${HY2_PASSWORD}"
+    sni: "${TLS_SERVER_NAME}"
+    skip-cert-verify: ${insecure}
+    obfs: salamander
+    obfs-password: "${HY2_OBFS}"
+
+  - name: TUIC-v5-Plus
+    type: tuic
+    server: "${SERVER_HOST}"
+    port: ${TUIC_PORT}
+    uuid: "${UUID}"
+    password: "${TUIC_PASSWORD}"
+    sni: "${TLS_SERVER_NAME}"
+    skip-cert-verify: ${insecure}
+    congestion-controller: bbr
+    udp-relay-mode: native
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - VLESS-Reality-Plus
+      - Hysteria2-Plus
+      - TUIC-v5-Plus
+      - DIRECT
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - MATCH,PROXY
+EOF
+}
+
+create_loon_config() {
+  local insecure
+  ensure_server_context
+  insecure="$(client_insecure_value)"
+  cat > "${LOON_PATH}" <<EOF
+# Loon 配置草案。不同 Loon 版本对 Reality/Hysteria2/TUIC 字段支持不同；
+# 如导入失败，请优先使用下方分享链接或 sing-box 客户端配置。
+
+[General]
+interface = 0.0.0.0
+port = 6152
+socks-port = 6153
+allow-wifi-access = false
+ipv6 = true
+
+[Proxy]
+VLESS-Reality-Plus = vless, ${SERVER_HOST}, ${VLESS_PORT}, uuid=${UUID}, tls=true, flow=xtls-rprx-vision, sni=${REALITY_SERVER_NAME}, reality=true, public-key=${REALITY_PUBLIC_KEY}, short-id=${REALITY_SHORT_ID}, client-fingerprint=chrome
+Hysteria2-Plus = hysteria2, ${SERVER_HOST}, ${HY2_PORT}, password=${HY2_PASSWORD}, sni=${TLS_SERVER_NAME}, skip-cert-verify=${insecure}, obfs=salamander, obfs-password=${HY2_OBFS}
+TUIC-v5-Plus = tuic, ${SERVER_HOST}, ${TUIC_PORT}, uuid=${UUID}, password=${TUIC_PASSWORD}, sni=${TLS_SERVER_NAME}, skip-cert-verify=${insecure}, congestion-controller=bbr, udp-relay-mode=native
+
+[Proxy Group]
+PROXY = select, VLESS-Reality-Plus, Hysteria2-Plus, TUIC-v5-Plus, DIRECT
+
+[Rule]
+FINAL, PROXY
+
+[Remote Proxy]
+# 也可直接导入这些分享链接：
+${VLESS_LINK}
+${HY2_LINK}
+${TUIC_LINK}
+EOF
+}
+
+create_shadowrocket_config() {
+  local insecure
+  ensure_server_context
+  insecure="$(client_insecure_value)"
+  cat > "${SHADOWROCKET_PATH}" <<EOF
+# Shadowrocket/小火箭配置草案。不同版本对 Reality/Hysteria2/TUIC 字段支持不同；
+# 最稳方式是复制 ${SHADOWROCKET_LINKS_PATH} 里的分享链接逐个导入。
+
+[General]
+bypass-system = true
+skip-proxy = 127.0.0.1, localhost, *.local
+dns-server = system, 1.1.1.1, 8.8.8.8
+
+[Proxy]
+VLESS-Reality-Plus = vless, ${SERVER_HOST}, ${VLESS_PORT}, uuid=${UUID}, tls=true, flow=xtls-rprx-vision, sni=${REALITY_SERVER_NAME}, reality=true, public-key=${REALITY_PUBLIC_KEY}, short-id=${REALITY_SHORT_ID}, client-fingerprint=chrome
+Hysteria2-Plus = hysteria2, ${SERVER_HOST}, ${HY2_PORT}, password=${HY2_PASSWORD}, sni=${TLS_SERVER_NAME}, skip-cert-verify=${insecure}, obfs=salamander, obfs-password=${HY2_OBFS}
+TUIC-v5-Plus = tuic, ${SERVER_HOST}, ${TUIC_PORT}, uuid=${UUID}, password=${TUIC_PASSWORD}, sni=${TLS_SERVER_NAME}, skip-cert-verify=${insecure}, congestion-controller=bbr, udp-relay-mode=native
+
+[Proxy Group]
+PROXY = select, VLESS-Reality-Plus, Hysteria2-Plus, TUIC-v5-Plus
+
+[Rule]
+FINAL, PROXY
+EOF
+
+  cat > "${SHADOWROCKET_LINKS_PATH}" <<EOF
+${VLESS_LINK}
+${HY2_LINK}
+${TUIC_LINK}
+EOF
+}
+
+create_client_outputs() {
+  create_mihomo_config
+  create_loon_config
+  create_shadowrocket_config
+}
+
 create_qrcodes() {
   mkdir -p "${QR_DIR}"
   if ! has_cmd qrencode; then
@@ -638,7 +821,7 @@ backup_current_config() {
   local backup_file
   backup_file="${BACKUP_DIR}/s-box-plus-$(date +%Y%m%d-%H%M%S).tar.gz"
   tar -czf "${backup_file}" -C "${BASE_DIR}" \
-    config.json client-sing-box.json env links.txt cert.pem private.key qrcode 2>/dev/null || true
+    config.json client-sing-box.json mihomo.yaml loon.conf shadowrocket.conf shadowrocket-links.txt env links.txt cert.pem private.key qrcode 2>/dev/null || true
   if [ -s "${backup_file}" ]; then
     green "已备份当前配置：${backup_file}"
   else
@@ -894,6 +1077,7 @@ install_all() {
   create_server_config
   create_client_config
   create_links
+  create_client_outputs
   create_qrcodes
   create_service
   "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "配置检查失败，未启动服务"
@@ -903,6 +1087,142 @@ install_all() {
   green "安装完成。快捷命令：sbp"
   show_info
   show_firewall_tips
+}
+
+install_auto() {
+  need_root
+  mkdir -p "${BASE_DIR}"
+  backup_current_config
+  install_deps
+  install_optional_tools
+  download_sing_box
+  collect_auto_inputs
+  if [ "${CERT_MODE:-1}" = "3" ]; then
+    issue_acme_cert
+  fi
+  ensure_cert
+  save_env
+  create_server_config
+  create_client_config
+  create_links
+  create_client_outputs
+  create_qrcodes
+  create_service
+  "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "配置检查失败，未启动服务"
+  systemctl daemon-reload
+  systemctl enable --now sing-box-plus
+  create_cli
+  green "无交互安装完成。快捷命令：sbp"
+  show_info
+  show_firewall_tips
+}
+
+rebuild_after_change() {
+  ensure_server_context
+  backup_current_config
+  if [ "${CERT_MODE:-1}" = "3" ]; then
+    issue_acme_cert
+  fi
+  ensure_cert
+  save_env
+  create_server_config
+  create_client_config
+  create_links
+  create_client_outputs
+  create_qrcodes
+  "${BIN_PATH}" check -c "${CONFIG_PATH}" || die "配置检查失败，已取消应用修改"
+  systemctl restart sing-box-plus
+  green "修改已应用并重启服务。"
+  show_info
+}
+
+change_config_menu() {
+  need_root
+  [ -x "${BIN_PATH}" ] || die "未安装 sing-box plus"
+  load_env
+  ensure_server_context
+  plain "修改配置"
+  plain "1. 修改服务器地址/IP"
+  plain "2. 修改 TLS SNI/证书域名"
+  plain "3. 修改 Reality 握手域名"
+  plain "4. 修改四个协议端口"
+  plain "5. 重新生成 UUID"
+  plain "6. 重新生成全部密码和 Reality 密钥"
+  plain "7. 修改/申请证书"
+  plain "0. 返回"
+  plain ""
+  read -r -p "请选择: " choice || true
+  case "${choice}" in
+    1)
+      SERVER_ADDR="$(read_default "服务器公网 IP 或域名" "${SERVER_HOST}")"
+      ;;
+    2)
+      TLS_SERVER_NAME="$(read_default "TLS SNI/证书域名" "${TLS_SERVER_NAME}")"
+      ;;
+    3)
+      REALITY_SERVER_NAME="$(read_default "Reality 握手域名" "${REALITY_SERVER_NAME}")"
+      REALITY_DEST="${REALITY_SERVER_NAME}:443"
+      ;;
+    4)
+      VLESS_PORT="$(read_default "VLESS Reality TCP 端口" "${VLESS_PORT}")"
+      ANYTLS_PORT="$(read_default "AnyTLS TCP 端口" "${ANYTLS_PORT}")"
+      HY2_PORT="$(read_default "Hysteria2 UDP 端口" "${HY2_PORT}")"
+      TUIC_PORT="$(read_default "TUIC v5 UDP 端口" "${TUIC_PORT}")"
+      ;;
+    5)
+      UUID="$("${BIN_PATH}" generate uuid)"
+      green "已重新生成 UUID：${UUID}"
+      ;;
+    6)
+      UUID="$("${BIN_PATH}" generate uuid)"
+      local keypair
+      keypair="$("${BIN_PATH}" generate reality-keypair)"
+      REALITY_PRIVATE_KEY="$(printf '%s\n' "${keypair}" | awk '/PrivateKey:/ {print $2}')"
+      REALITY_PUBLIC_KEY="$(printf '%s\n' "${keypair}" | awk '/PublicKey:/ {print $2}')"
+      REALITY_SHORT_ID="$(random_hex 8)"
+      ANYTLS_PASSWORD="$(random_base64 24 32)"
+      HY2_PASSWORD="$(random_base64 24 32)"
+      HY2_OBFS="$(random_base64 16 24)"
+      TUIC_PASSWORD="$(random_base64 24 32)"
+      green "已重新生成 UUID、密码和 Reality 密钥。"
+      ;;
+    7)
+      plain "TLS 证书模式："
+      plain "1. 自签证书"
+      plain "2. 使用已有证书"
+      plain "3. 在线申请 Let's Encrypt 证书"
+      CERT_MODE="$(read_default "请选择证书模式" "${CERT_MODE:-1}")"
+      case "${CERT_MODE}" in
+        1)
+          TLS_CERT_PATH=""
+          TLS_KEY_PATH=""
+          ;;
+        2)
+          TLS_CERT_PATH="$(read_default "TLS 证书 fullchain 路径" "${TLS_CERT_PATH:-${CERT_PATH}}")"
+          TLS_KEY_PATH="$(read_default "TLS 私钥路径" "${TLS_KEY_PATH:-${KEY_PATH}}")"
+          ;;
+        3)
+          ACME_DOMAIN="$(read_default "申请证书的域名" "${TLS_SERVER_NAME}")"
+          ACME_EMAIL="$(read_default "ACME 邮箱" "admin@${ACME_DOMAIN}")"
+          ;;
+        *) die "无效证书模式" ;;
+      esac
+      ;;
+    0) menu ;;
+    *) die "无效选择" ;;
+  esac
+  rebuild_after_change
+}
+
+regenerate_client_outputs() {
+  need_root
+  load_env
+  ensure_server_context
+  create_links
+  create_client_outputs
+  create_qrcodes
+  green "客户端配置已重新生成。"
+  show_info
 }
 
 show_info() {
@@ -918,6 +1238,10 @@ show_info() {
   plain "服务状态：systemctl status sing-box-plus --no-pager"
   plain "查看日志：journalctl -u sing-box-plus -f"
   plain "客户端配置：${CLIENT_PATH}"
+  plain "Mihomo/Clash 配置：${MIHOMO_PATH}"
+  plain "Loon 配置草案：${LOON_PATH}"
+  plain "小火箭配置草案：${SHADOWROCKET_PATH}"
+  plain "小火箭分享链接：${SHADOWROCKET_LINKS_PATH}"
   plain "二维码目录：${QR_DIR}"
 }
 
@@ -963,7 +1287,9 @@ menu() {
   plain "7. 防火墙/安全组提示"
   plain "8. 恢复配置备份"
   plain "9. 南京电信/华东电信优化检测"
-  plain "10. 卸载"
+  plain "10. 修改端口/UUID/SNI/证书"
+  plain "11. 重新生成客户端配置"
+  plain "12. 卸载"
   plain "0. 退出"
   plain ""
   read -r -p "请选择: " choice || true
@@ -977,15 +1303,20 @@ menu() {
     7) show_firewall_tips ;;
     8) restore_backup ;;
     9) east_ct_menu ;;
-    10) uninstall_all ;;
+    10) change_config_menu ;;
+    11) regenerate_client_outputs ;;
+    12) uninstall_all ;;
     0) exit 0 ;;
     *) die "无效选择" ;;
   esac
 }
 
 case "${1:-}" in
+  auto) install_auto ;;
   install) install_all ;;
   info) show_info ;;
+  change) change_config_menu ;;
+  clients | output) regenerate_client_outputs ;;
   restart) restart_service ;;
   status) show_status ;;
   logs) show_logs ;;
