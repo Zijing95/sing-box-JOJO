@@ -1,4 +1,4 @@
-### 一、Sing-box-yg精装桶一键四协议共存脚本（VPS专用）
+### 一、Sing-box-yg精装桶一键五协议共存脚本（VPS专用）
 ### 二、Serv00/Hostuno-sb-yg多平台一键三协议共存脚本（Serv00/Hostuno专用）
 
 ### 注：本项目分享订阅节点都为本地化生成，不使用节点转换、订阅器等第三方外链引用，无需担心节点订阅被外链作者查看
@@ -10,9 +10,9 @@
 
 --------------------------------------------------------------
 
-### 一、Sing-box-yg精装桶小白专享一键四协议共存脚本（VPS专用）
+### 一、Sing-box-yg精装桶小白专享一键五协议共存脚本（VPS专用）
 
-* 支持人气最高的四大协议：Vless-reality-vision、Vmess-ws(tls)/Argo、Hysteria-2、Tuic-v5
+* 支持人气最高的五大协议：Vless-reality-vision、Vmess-ws(tls)/Argo、Hysteria-2、Tuic-v5、Anytls
 
 * 支持纯IPV6、纯IPV4、双栈VPS，支持amd与arm架构，支持alpine系统，推荐使用最新的Ubuntu系统
 
@@ -21,6 +21,9 @@
 #### 相关说明及注意点请查看[甬哥博客说明与Sing-box视频教程](https://ygkkk.blogspot.com/2023/10/sing-box-yg.html)
 
 #### 视频教程：
+[SSH连不上？使用VPS内置SSH，配合一键功能化脚本命令，小白也能快速搭节点！（Racknerd等所有VPS通用）](https://youtu.be/vhqPG9h8PB4)
+
+[Racknerd VPS：小白自建最强翻墙代理协议组合方案；高速、稳定、无视IP被封；解决Google gemini无法使用问题](https://youtu.be/aGEmCu503V8)
 
 [🥇搭建代理9大问题排行榜：第4名全网99%的人被误导！第1名每个人都被折腾到爆！](https://youtu.be/pJwJBqBkcfw)
 
@@ -36,6 +39,8 @@
 
 [Sing-box精装桶小白一键脚本（五）：集成oblivion warp免费vpn功能，本地WARP+赛风VPN切换分流(30个国家IP)](https://youtu.be/5Y6NPsYPws0)
 
+[Sing-box精装桶五合一脚本重磅更新（六）：新增AnyTLS协议；本地IP订阅自动同步更新，通吃Clash/Mihomo、Sing-box与聚合节点](https://youtu.be/LF0-n6-Z6kI)
+
 ### VPS专用一键脚本如下：快捷方式：```sb```
 
 ```
@@ -45,6 +50,15 @@ bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
 ```
+
+一键快捷命令现实本地IP订阅：```printf '3\n8\n1\n订阅密码' | sb```
+
+一键快捷命令现实Argo临时隧道：```printf '3\n3\n1\n1' | sb```
+
+一键快捷命令现实Argo固定隧道：```printf '3\n3\n2\n1\n固定密钥\n固定域名' | sb```
+
+一键快捷命令现实域名分流：```printf '5\n2\n1\n后缀域名1 后缀域名2' | sb```
+
 
 ### Sing-box-yg脚本界面预览图（注：相关参数随意填写，仅供围观）
 
